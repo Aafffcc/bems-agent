@@ -29,7 +29,7 @@ from bems_agent.agent.mcp import (
 )
 from bems_agent.agent.prompts import SYSTEM_PROMPT
 from bems_agent.agent.sessions import SessionStore, patch_aiosqlite
-from bems_agent.core.config import get_settings
+from bems_agent.core.config import Settings, get_settings, reload_settings
 from bems_agent.core.deepagents_cli_compat import ensure_deepagents_cli_available
 
 ensure_deepagents_cli_available()
@@ -54,6 +54,20 @@ ASSISTANT_ID = "bems-agent"
 class RuntimeKey:
     mcp_enabled: bool
     model: str
+
+
+@dataclass(frozen=True, slots=True)
+class RuntimeSettingsFingerprint:
+    agent_model: str | None
+    anthropic_model: str | None
+    anthropic_api_key: str | None
+    anthropic_auth_token: str | None
+    anthropic_base_url: str | None
+    mcp_enabled: bool
+    mcp_config_path: str
+    session_db_path: str
+    skills_paths: tuple[str, ...]
+    memory_paths: tuple[str, ...]
 
 
 @dataclass(slots=True)
@@ -127,15 +141,53 @@ class AgentRuntime:
 
     def __init__(self) -> None:
         self._settings = get_settings()
+        self._settings_fingerprint = self._build_settings_fingerprint(self._settings)
         self._handles: dict[RuntimeKey, RuntimeHandle] = {}
 
-    def _apply_provider_environment(self) -> None:
-        anthropic_api_key = self._settings.resolved_anthropic_api_key
-        if anthropic_api_key and not os.environ.get("ANTHROPIC_API_KEY"):
-            os.environ["ANTHROPIC_API_KEY"] = anthropic_api_key
+    @staticmethod
+    def _build_settings_fingerprint(settings: Settings) -> RuntimeSettingsFingerprint:
+        return RuntimeSettingsFingerprint(
+            agent_model=settings.agent_model,
+            anthropic_model=settings.anthropic_model,
+            anthropic_api_key=settings.anthropic_api_key,
+            anthropic_auth_token=settings.anthropic_auth_token,
+            anthropic_base_url=settings.anthropic_base_url,
+            mcp_enabled=settings.mcp_enabled,
+            mcp_config_path=str(settings.resolved_mcp_config_path),
+            session_db_path=str(settings.bems_session_db_path),
+            skills_paths=tuple(settings.resolved_skills_paths),
+            memory_paths=tuple(settings.resolved_memory_paths),
+        )
 
-        if self._settings.anthropic_base_url and not os.environ.get("ANTHROPIC_BASE_URL"):
-            os.environ["ANTHROPIC_BASE_URL"] = self._settings.anthropic_base_url
+    async def _refresh_settings(self) -> None:
+        settings = reload_settings()
+        fingerprint = self._build_settings_fingerprint(settings)
+        if fingerprint != self._settings_fingerprint:
+            await self.shutdown()
+            self._settings_fingerprint = fingerprint
+        self._settings = settings
+
+    def _sync_environment_variable(self, name: str, value: str | None) -> None:
+        if value:
+            os.environ[name] = value
+            return
+        os.environ.pop(name, None)
+
+    def _apply_provider_environment(self) -> None:
+        self._sync_environment_variable("AGENT_MODEL", self._settings.agent_model)
+        self._sync_environment_variable("ANTHROPIC_MODEL", self._settings.anthropic_model)
+        self._sync_environment_variable(
+            "ANTHROPIC_API_KEY",
+            self._settings.resolved_anthropic_api_key,
+        )
+        self._sync_environment_variable(
+            "ANTHROPIC_AUTH_TOKEN",
+            self._settings.anthropic_auth_token,
+        )
+        self._sync_environment_variable(
+            "ANTHROPIC_BASE_URL",
+            self._settings.anthropic_base_url,
+        )
 
     async def startup(
         self,
@@ -143,6 +195,7 @@ class AgentRuntime:
         mcp_enabled: bool | None = None,
         model_override: str | None = None,
     ) -> RuntimeHandle:
+        await self._refresh_settings()
         self._apply_provider_environment()
         resolved_mcp_enabled = self._settings.mcp_enabled if mcp_enabled is None else mcp_enabled
         resolved_model = self._resolve_model(model_override)
@@ -376,6 +429,13 @@ class ConversationService:
         self._runtime = runtime
         self._session_store = session_store
 
+    def _get_session_store(self, *, refresh: bool = False) -> SessionStore:
+        settings = reload_settings() if refresh else get_settings()
+        db_path = settings.bems_session_db_path
+        if self._session_store.db_path != db_path:
+            self._session_store = SessionStore(db_path)
+        return self._session_store
+
     async def open_session(
         self,
         *,
@@ -388,13 +448,14 @@ class ConversationService:
             mcp_enabled=mcp_enabled,
             model_override=model_override,
         )
+        session_store = self._get_session_store()
 
         created_thread = create_new or session_id is None
         if created_thread:
-            thread_id = self._session_store.create_thread(session_id)
+            thread_id = session_store.create_thread(session_id)
         else:
             assert session_id is not None
-            self._session_store.ensure_thread_exists(session_id)
+            session_store.ensure_thread_exists(session_id)
             thread_id = session_id
 
         return ConversationSessionContext(
@@ -429,7 +490,7 @@ class ConversationService:
             mcp_enabled=context.mcp_enabled,
             model_override=context.model,
         )
-        self._session_store.mark_persisted(context.thread_id)
+        self._get_session_store().mark_persisted(context.thread_id)
         return ConversationResult(
             thread_id=context.thread_id,
             response=invocation.response,
@@ -475,7 +536,7 @@ class ConversationService:
             msg = "Agent returned no messages."
             raise AgentConfigurationError(msg)
 
-        self._session_store.mark_persisted(context.thread_id)
+        self._get_session_store().mark_persisted(context.thread_id)
         yield ConversationTraceEvent(
             kind="final_response",
             title="Response ready",
@@ -484,6 +545,7 @@ class ConversationService:
         )
 
     def list_sessions(self) -> list[dict[str, str | int]]:
+        session_store = self._get_session_store(refresh=True)
         return [
             {
                 "thread_id": session.thread_id,
@@ -491,7 +553,7 @@ class ConversationService:
                 "updated_at": session.updated_at,
                 "turn_count": session.turn_count,
             }
-            for session in self._session_store.list_sessions()
+            for session in session_store.list_sessions()
         ]
 
 

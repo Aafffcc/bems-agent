@@ -115,6 +115,7 @@ async def test_handle_slash_command_switches_model(monkeypatch: pytest.MonkeyPat
             memory_paths=current_state.memory_paths,
             mcp_tools=current_state.mcp_tools,
             trace_enabled=current_state.trace_enabled,
+            model_override="openai:gpt-5.5",
         )
 
     monkeypatch.setattr(cli, "refresh_runtime_state", fake_refresh_runtime_state)
@@ -123,6 +124,57 @@ async def test_handle_slash_command_switches_model(monkeypatch: pytest.MonkeyPat
 
     assert should_continue is True
     assert updated.model == "openai:gpt-5.5"
+    assert updated.model_override == "openai:gpt-5.5"
+
+
+@pytest.mark.asyncio
+async def test_refresh_runtime_state_keeps_default_model_unpinned(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = ChatRuntimeState(
+        thread_id="thread-1",
+        model="anthropic:claude-haiku-4-5",
+        mcp_enabled=True,
+        tool_count=1,
+        mcp_tool_names=[],
+        skills_paths=["skills/project"],
+        memory_paths=["AGENTS.md"],
+        mcp_tools=[],
+        model_override=None,
+    )
+
+    async def fake_open_session(
+        *,
+        session_id: str | None = None,
+        create_new: bool = False,
+        mcp_enabled: bool | None = None,
+        model_override: str | None = None,
+    ):
+        assert session_id == "thread-1"
+        assert create_new is False
+        assert mcp_enabled is True
+        assert model_override is None
+        return type(
+            "ContextStub",
+            (),
+            {
+                "thread_id": "thread-1",
+                "model": "anthropic:claude-sonnet-4-6",
+                "mcp_enabled": True,
+                "tool_count": 1,
+                "tool_names": [],
+                "skills_paths": ["skills/project"],
+                "memory_paths": ["AGENTS.md"],
+                "mcp_tools": [],
+            },
+        )()
+
+    monkeypatch.setattr(cli.conversation_service, "open_session", fake_open_session)
+
+    updated = await cli.refresh_runtime_state(state)
+
+    assert updated.model == "anthropic:claude-sonnet-4-6"
+    assert updated.model_override is None
 
 
 @pytest.mark.asyncio
@@ -236,6 +288,15 @@ def test_match_slash_commands_returns_ranked_matches() -> None:
     assert matches[0].command == "/skills"
 
 
+def test_match_slash_commands_skips_existing_absolute_file_path(tmp_path: Path) -> None:
+    file_path = tmp_path / "test dataset.csv"
+    file_path.write_text("name\nahu-01\n", encoding="utf-8")
+
+    matches = cli.match_slash_commands(file_path.as_posix())
+
+    assert matches == []
+
+
 def test_match_file_mentions_returns_project_file_matches(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -278,6 +339,28 @@ def test_build_message_input_embeds_referenced_file(
     assert "## Referenced Files" in message
     assert "notes.txt" in message
     assert "energy baseline" in message
+
+
+def test_build_message_input_embeds_leading_absolute_path_reference(tmp_path: Path) -> None:
+    file_path = tmp_path / "test dataset.csv"
+    file_path.write_text("device_id,name\n1,AHU-01\n", encoding="utf-8")
+
+    message = cli.build_message_input(f"{file_path.as_posix()} 把这份数据导入数据库")
+
+    assert message.startswith("把这份数据导入数据库")
+    assert "## Referenced Files" in message
+    assert "test dataset.csv" in message
+    assert "device_id,name" in message
+
+
+def test_is_slash_command_input_treats_leading_absolute_path_as_message(
+    tmp_path: Path,
+) -> None:
+    file_path = tmp_path / "dataset.csv"
+    file_path.write_text("id\n1\n", encoding="utf-8")
+
+    assert cli.is_slash_command_input("/help") is True
+    assert cli.is_slash_command_input(f"{file_path.as_posix()} 把这份数据导入数据库") is False
 
 
 def test_print_skills_list_only_shows_name_and_description(
@@ -436,3 +519,42 @@ def test_print_trace_event_card_formats_mcp_tool_output(capsys: pytest.CaptureFi
     assert "list_device(building_id=BUILD-003)" in output
     assert "MCP Result" in output
     assert '"device_id": "DEV-003-01"' in output
+
+
+def test_format_assistant_response_normalizes_markdown() -> None:
+    response = "\n".join(
+        [
+            "# Summary",
+            "",
+            "Hi! I can help you with:",
+            "- **Building energy analysis** - consumption trends, anomalies, optimization",
+            "- **Device telemetry** - status, performance, COP analysis",
+            "",
+            "```json",
+            '{"device":"AHU-01"}',
+            "```",
+            "",
+            "What would you like to explore?",
+        ]
+    )
+
+    formatted = cli.format_assistant_response(response)
+
+    assert "SUMMARY" in formatted
+    assert "**" not in formatted
+    assert "  - Building energy analysis: consumption trends, anomalies, optimization" in formatted
+    assert "  - Device telemetry: status, performance, COP analysis" in formatted
+    assert '    {"device":"AHU-01"}' in formatted
+    assert "What would you like to explore?" in formatted
+
+
+def test_print_assistant_response_uses_terminal_friendly_format(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    cli.print_assistant_response("## Result\n\n- **Status** - ok")
+
+    output = capsys.readouterr().out
+
+    assert "RESULT" in output
+    assert "  - Status: ok" in output
+    assert "**" not in output

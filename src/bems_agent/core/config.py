@@ -46,8 +46,8 @@ class Settings(BaseSettings):
     ) -> tuple[PydanticBaseSettingsSource, ...]:
         return (
             init_settings,
-            env_settings,
             dotenv_settings,
+            env_settings,
             file_secret_settings,
         )
 
@@ -127,3 +127,8 @@ class Settings(BaseSettings):
 @lru_cache
 def get_settings() -> Settings:
     return Settings()
+
+
+def reload_settings() -> Settings:
+    get_settings.cache_clear()
+    return get_settings()

@@ -1,0 +1,79 @@
+{
+  "status": "ready",
+  "input_file": "/Users/zihenggao/Downloads/test_dataset.csv",
+  "detected_format": "csv",
+  "target_table": "demo",
+  "raw_row_count": 10,
+  "cleaned_row_count": 10,
+  "row_issues": [
+    {
+      "row_number": 5,
+      "kind": "row_length_repaired",
+      "detail": "expected 14 columns, got 15"
+    },
+    {
+      "row_number": 6,
+      "kind": "row_length_repaired",
+      "detail": "expected 14 columns, got 15"
+    },
+    {
+      "row_number": 7,
+      "kind": "row_length_repaired",
+      "detail": "expected 14 columns, got 15"
+    },
+    {
+      "row_number": 8,
+      "kind": "row_length_repaired",
+      "detail": "expected 14 columns, got 16"
+    },
+    {
+      "row_number": 9,
+      "kind": "row_length_repaired",
+      "detail": "expected 14 columns, got 16"
+    },
+    {
+      "row_number": 10,
+      "kind": "row_length_repaired",
+      "detail": "expected 14 columns, got 16"
+    },
+    {
+      "row_number": 11,
+      "kind": "row_length_repaired",
+      "detail": "expected 14 columns, got 15"
+    }
+  ],
+  "field_mapping": {
+    "building_id": "building_id",
+    "building_type": "building_type",
+    "monitor_time": "monitor_time",
+    "electricity_kwh": "electricity_kwh",
+    "water_m3": "water_m3",
+    "hvac_kwh": "hvac_kwh",
+    "supply_water_temp_c": "supply_water_temp_c",
+    "return_water_temp_c": "return_water_temp_c",
+    "ambient_temp_c": "ambient_temp_c",
+    "humidity_rh": "humidity_rh",
+    "occupancy_density_per_100m2": "occupancy_density_per_100m2",
+    "device_id": "device_id",
+    "device_status": "device_status",
+    "cop": "cop"
+  },
+  "excluded_source_fields": [],
+  "missing_required_fields": [],
+  "existing_building_ids": [
+    "BUILD-001",
+    "BUILD-002",
+    "BUILD-003",
+    "BUILD-004",
+    "BUILD-005",
+    "BUILD-006"
+  ],
+  "new_building_ids": [
+    "test"
+  ],
+  "building_base_action": "new_building_id_detected_but_metadata_incomplete",
+  "artifacts": {
+    "summary": "/Library/WorkSpace Python/bems-agent/skills/project/import-dataset-to-db/runtime/20260323-143320/summary.json",
+    "demo": "/Library/WorkSpace Python/bems-agent/skills/project/import-dataset-to-db/runtime/20260323-143320/demo.records.json"
+  }
+}

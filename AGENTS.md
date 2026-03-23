@@ -24,11 +24,17 @@
 - Agent runtime：基于本地 `deepagents` + `deepagents_cli` 中间件与工具显示能力组装
 - 工作流运行时：LangGraph
 - 会话存储：LangGraph SQLite checkpointer，默认数据库 `~/.bems-agent/sessions.db`
+- HTTP API：当前仅暴露安全路由 `GET /api/v1/health`、`POST /api/v1/agent/invoke`、`POST /api/v1/agent/stream`
+- HTTP 请求校验：`user_input` 会去除首尾空白且禁止空字符串；`thread_id/session_id` 仅接受安全字符；请求体默认拒绝未声明字段
+- HTTP 流式输出：使用 SSE，仅输出 `status`、`tool_call`、`tool_result`、`final_response`、`error` 这些安全事件；不暴露原始 chain-of-thought，也不透出完整 tool 原始输出
 - CLI trace：默认展示执行步骤，不暴露原始 chain-of-thought，只显示工具调用与结果摘要
 - CLI trace 渲染：复用 `deepagents_cli.tool_display` 的紧凑展示策略，避免把长 JSON / 长文本原样倾倒到终端
+- CLI 最终回答渲染：交互式终端内不直接原样打印 markdown；标题、列表、强调、代码块需规范化为更适合终端阅读的纯文本布局
 - CLI slash 交互：交互模式下使用 `prompt_toolkit` 提供 slash 命令自动匹配、当前项高亮、上下键切换、右键/Enter 选中、左键/Esc 关闭，以及 `/skills`、`/mcp`、`/model`、`/trace` 的二级 action 面板
 - CLI 文件引用交互：支持通过 `@filename` 自动补全项目内文件，并在提交消息时把引用文件内容以内联上下文形式注入给 agent；超大文件只注入路径与大小提示，不直接嵌入全文
+- CLI 绝对路径粘贴：当用户消息以本地绝对文件路径开头时，应优先识别为文件引用而不是 slash 命令；支持 `"/abs/path/file.csv 后续提示词"` 这种前导路径输入，并在提交时自动注入文件上下文
 - CLI 退出清理：CLI 进程结束前必须显式执行 runtime shutdown，先释放 MCP session 再结束事件循环，避免正常 `/exit` 时出现异步生成器清理错误日志
+- 配置刷新：agent runtime 在每次启动/打开会话前都会重新加载 `.env`；模型、`ANTHROPIC_API_KEY`/`ANTHROPIC_AUTH_TOKEN`、`ANTHROPIC_BASE_URL` 以 `.env` 为优先来源，并在配置变更后丢弃旧 runtime handle，避免继续复用旧模型或旧鉴权
 - 上下文加载：通过 `MemoryMiddleware` 加载 `AGENTS.md`，默认来源包括项目根 `AGENTS.md`、`.deepagents/AGENTS.md` 和 `${BEMS_HOME}/AGENTS.md`
 - Skills：
   - 项目技能目录：`skills/project/`
@@ -49,6 +55,7 @@
 │   └── project/
 ├── config/
 │   └── mcp_servers.json
+├── api.md
 ├── src/bems_agent/
 │   ├── agent/
 │   │   ├── exceptions.py
@@ -99,8 +106,9 @@ BEMS_SKILLS_PATHS=
 
 说明：
 
-- 优先使用 `AGENT_MODEL`。
+- 优先使用 `.env` 中的 `AGENT_MODEL`。
 - 如果未设置 `AGENT_MODEL`，会回退到 `ANTHROPIC_MODEL`。
+- 若 shell / IDE 进程里存在同名环境变量，当前实现会优先采用 `.env` 中的值，避免旧环境变量覆盖用户配置。
 - 推荐使用支持 tool calling 的模型。
 - `MCP_CONFIG_PATH` 当前默认指向项目内置配置。
 - `BEMS_SESSION_DIR` 未显式设置时，默认落到 `${BEMS_HOME}/sessions`。
@@ -168,6 +176,23 @@ BEMS_SKILLS_PATHS=
   - `/model <provider:model>`
   - `/mcp on|off`
   - `/trace on|off`
+
+### HTTP API Rules
+
+- HTTP 层默认只暴露前端联调必须的安全接口，不暴露 CLI 命令控制、模型切换、MCP 开关、skills 浏览或本地运行时调试接口。
+- `POST /agent/invoke` 返回最终回答与 `thread_id/session_id`。
+- `POST /agent/stream` 返回 SSE，最终事件必须包含 `thread_id/session_id` 与 `response`。
+- SSE 中的 tool 相关事件只允许输出摘要级 `detail`，不要直接透出完整 tool 原始输出。
+- 健康检查接口默认只返回最小健康信息，不返回环境、服务名或其他内部配置细节。
+- 根目录 `api.md` 是 HTTP API 的唯一详细文档来源。
+- 以后所有与 API 相关的改动都必须同步更新 `api.md`，至少包括：
+  - 新增/删除接口
+  - 路由路径变更
+  - 请求参数、请求头、请求体约束变更
+  - 响应结构、状态码、错误码变更
+  - SSE 事件类型与字段变更
+  - 安全限制、兼容性说明、调用示例变更
+- 如果某次提交改动了 API 代码但没有同步更新 `api.md`，视为变更不完整。
 
 ### CLI Rules
 
@@ -310,6 +335,8 @@ AI CLI 在本项目中应遵循以下方式：
   - CLI-first 入口
   - deepagents / deepagents_cli 集成
   - skills 目录接入
+  - 项目内置 `analyze-device-cop` skill，可针对指定设备与时间段优先调用 `calculate_cop` 做 COP 分析
+  - 项目内置 `import-dataset-to-db` skill，可针对用户提供的 SQL/JSON/CSV 文件执行读取、清洗、字段匹配与筛选后再调用 `import_dataset`，当前导入目标聚焦 `demo` 与 `building_base`，并默认优先落 `demo`，仅在出现新的 `building_id` 时再评估是否补充写入 `building_base`
   - 基于 SQLite checkpointer 的 thread 持久化
   - `AGENTS.md` memory source 接入
   - 执行步骤 trace
@@ -320,6 +347,12 @@ AI CLI 在本项目中应遵循以下方式：
   - `/mcp list` 元数据视图
   - MCP 接入与规范化
   - CLI 正常退出时的 runtime / MCP 显式清理与幂等容错关闭
-  - 基础 HTTP API
+  - `.env` 模型与 Anthropic 鉴权/网关配置热刷新，避免旧环境变量或旧 runtime cache 覆盖新配置
+  - 安全 HTTP API：
+    - `GET /api/v1/health`
+    - `POST /api/v1/agent/invoke`
+    - `POST /api/v1/agent/stream`
+  - HTTP 请求白名单校验、结构化错误翻译与安全 SSE 输出
+  - 根目录 `api.md` 作为 HTTP API 详细文档
 - 当前项目尚未接入真实业务模型、数据库表和业务工具链。
-- 当前 `agent/invoke` 已具备 session 透传语义，可作为服务化扩展入口。
+- 当前 `agent/invoke` / `agent/stream` 已具备 session 透传语义，可作为服务化扩展入口。

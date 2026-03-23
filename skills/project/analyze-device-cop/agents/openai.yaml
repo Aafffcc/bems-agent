@@ -1,0 +1,4 @@
+interface:
+  display_name: "Analyze Device COP"
+  short_description: "Analyze device COP over a time range"
+  default_prompt: "Use $analyze-device-cop to analyze COP for a specific device over a requested time range."

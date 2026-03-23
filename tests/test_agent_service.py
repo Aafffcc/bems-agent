@@ -45,6 +45,7 @@ def test_conversation_result_exposes_session_alias() -> None:
 
     assert result.session_id == "thread-123"
 
+
 def test_agent_runtime_applies_anthropic_provider_environment(monkeypatch) -> None:
     runtime = AgentRuntime()
     runtime._settings.anthropic_api_key = None
@@ -58,6 +59,29 @@ def test_agent_runtime_applies_anthropic_provider_environment(monkeypatch) -> No
 
     assert os.environ["ANTHROPIC_API_KEY"] == "bridge-token"
     assert os.environ["ANTHROPIC_BASE_URL"] == "https://api.jiekou.ai/anthropic"
+
+
+def test_agent_runtime_overwrites_stale_provider_environment(monkeypatch) -> None:
+    runtime = AgentRuntime()
+    runtime._settings.agent_model = "anthropic:claude-sonnet-4-6"
+    runtime._settings.anthropic_model = "claude-sonnet-4-6"
+    runtime._settings.anthropic_api_key = "fresh-key"
+    runtime._settings.anthropic_auth_token = None
+    runtime._settings.anthropic_base_url = "https://fresh.example"
+
+    monkeypatch.setenv("AGENT_MODEL", "anthropic:claude-haiku-4-5")
+    monkeypatch.setenv("ANTHROPIC_MODEL", "claude-haiku-4-5")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "stale-key")
+    monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "stale-token")
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://stale.example")
+
+    runtime._apply_provider_environment()
+
+    assert os.environ["AGENT_MODEL"] == "anthropic:claude-sonnet-4-6"
+    assert os.environ["ANTHROPIC_MODEL"] == "claude-sonnet-4-6"
+    assert os.environ["ANTHROPIC_API_KEY"] == "fresh-key"
+    assert "ANTHROPIC_AUTH_TOKEN" not in os.environ
+    assert os.environ["ANTHROPIC_BASE_URL"] == "https://fresh.example"
 
 
 def test_extract_message_trace_events_builds_tool_call_and_detects_text() -> None:

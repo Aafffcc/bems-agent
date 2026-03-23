@@ -104,9 +104,51 @@ HTTP 服务默认地址（读取 `.env` 中的 `APP_HOST` / `APP_PORT`）：
 - skills 加载：
   - 项目技能 `skills/project/`
   - 用户技能 `~/.bems-agent/skills/`
+- 项目内置 `import-dataset-to-db` skill，可针对 SQL / JSON / CSV 数据文件执行读取、清洗、字段映射与导入前筛选
 - MCP 工具接入
-- FastAPI 健康检查与 agent 调用接口
+- FastAPI 安全 HTTP API：
+  - `POST /api/v1/agent/invoke`
+  - `POST /api/v1/agent/stream`
+  - `GET /api/v1/health`
 - PostgreSQL 异步连接初始化
+
+## HTTP API
+
+当前 HTTP 层只暴露面向前端联调所需的安全接口，不开放 CLI 控制类能力，也不允许通过请求动态切换模型、MCP 或其他运行时配置。
+
+请求约束：
+
+- `user_input` 必填，自动去除首尾空白，且不能是空字符串
+- `thread_id` / `session_id` 可选，二者等价；如传入则必须满足安全字符约束
+- 请求体默认 `extra="forbid"`，不会接受未声明字段
+
+流式接口说明：
+
+- `POST /api/v1/agent/stream`
+- 返回 `text/event-stream`
+- 事件类型仅包含：
+  - `status`
+  - `tool_call`
+  - `tool_result`
+  - `final_response`
+  - `error`
+- 不返回模型原始 chain-of-thought，也不会透出完整 tool 原始输出
+
+单轮调用示例：
+
+```bash
+curl -X POST http://127.0.0.1:9933/api/v1/agent/invoke \
+  -H "Content-Type: application/json" \
+  -d '{"user_input":"分析 1 号楼昨日能耗","session_id":"thread-123"}'
+```
+
+流式调用示例：
+
+```bash
+curl -N -X POST http://127.0.0.1:9933/api/v1/agent/stream \
+  -H "Content-Type: application/json" \
+  -d '{"user_input":"分析 1 号楼昨日能耗","session_id":"thread-123"}'
+```
 
 ## MCP 配置
 

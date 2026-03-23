@@ -54,6 +54,7 @@ find_project_root = importlib.import_module("deepagents_cli.project_utils").find
 fuzzy_search_files = _autocomplete._fuzzy_search
 get_project_files = _autocomplete._get_project_files
 parse_file_mentions = _input.parse_file_mentions
+parse_pasted_path_payload = _input.parse_pasted_path_payload
 EMAIL_PREFIX_PATTERN = _input.EMAIL_PREFIX_PATTERN
 
 RESET = "\033[0m"
@@ -75,6 +76,7 @@ class ChatRuntimeState:
     mcp_tools: list[MCPToolMetadata]
     trace_enabled: bool = True
     file_completion_roots: list[str] = field(default_factory=list)
+    model_override: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -328,6 +330,7 @@ def build_runtime_state(
         mcp_tools=context.mcp_tools,
         trace_enabled=trace_enabled,
         file_completion_roots=[get_settings().project_root.as_posix()],
+        model_override=None,
     )
 
 
@@ -528,6 +531,8 @@ def list_completion_files(root: Path) -> list[str]:
 def match_slash_commands(text: str) -> list[SlashCommandSummary]:
     if not text.startswith("/"):
         return []
+    if parse_pasted_path_payload(text, allow_leading_path=True) is not None:
+        return []
 
     search = text[1:].lower()
     if " " in search:
@@ -661,7 +666,11 @@ def apply_selected_completion(buffer: object) -> bool:
 
 
 def completion_mode(text: str) -> str | None:
-    if text.startswith("/") and " " not in text:
+    if (
+        text.startswith("/")
+        and " " not in text
+        and parse_pasted_path_payload(text, allow_leading_path=True) is None
+    ):
         return "slash"
     if extract_file_mention_fragment(text) is not None:
         return "file"
@@ -778,13 +787,38 @@ def print_file_completion_roots(state: ChatRuntimeState) -> None:
         print(f"  {index}. [{scope}] {root}")
 
 
-def build_message_input(user_input: str) -> str:
+def collect_referenced_files(user_input: str) -> tuple[str, list[Path]]:
     prompt_text, mentioned_files = parse_file_mentions(user_input)
-    if not mentioned_files:
+    referenced_files: list[Path] = []
+    seen_paths: set[str] = set()
+
+    def add_paths(paths: list[Path]) -> None:
+        for path in paths:
+            path_key = path.as_posix()
+            if path_key in seen_paths:
+                continue
+            seen_paths.add(path_key)
+            referenced_files.append(path)
+
+    add_paths(mentioned_files)
+
+    pasted_payload = parse_pasted_path_payload(user_input, allow_leading_path=True)
+    if pasted_payload is None:
+        return prompt_text, referenced_files
+
+    add_paths(pasted_payload.paths)
+    if pasted_payload.token_end is not None:
+        prompt_text = prompt_text[pasted_payload.token_end :].lstrip()
+    return prompt_text, referenced_files
+
+
+def build_message_input(user_input: str) -> str:
+    prompt_text, referenced_files = collect_referenced_files(user_input)
+    if not referenced_files:
         return prompt_text
 
     context_parts = [prompt_text, "\n\n## Referenced Files\n"]
-    for file_path in mentioned_files:
+    for file_path in referenced_files:
         try:
             file_size = file_path.stat().st_size
             if file_size > MAX_FILE_EMBED_BYTES:
@@ -800,10 +834,16 @@ def build_message_input(user_input: str) -> str:
             context_parts.append(
                 f"\n### {file_path.name}\n"
                 f"Path: `{file_path}`\n```\n{content}\n```"
-            )
+                )
         except Exception as exc:
             context_parts.append(f"\n### {file_path.name}\n[Error reading file: {exc}]")
     return "\n".join(context_parts)
+
+
+def is_slash_command_input(user_input: str) -> bool:
+    return user_input.startswith("/") and (
+        parse_pasted_path_payload(user_input, allow_leading_path=True) is None
+    )
 
 
 async def run_command_menu(menu: SlashCommandMenu) -> str | None:
@@ -937,10 +977,11 @@ async def refresh_runtime_state(
     mcp_enabled: bool | None = None,
     model_override: str | None = None,
 ) -> ChatRuntimeState:
+    resolved_model_override = state.model_override if model_override is None else model_override
     context = await conversation_service.open_session(
         session_id=state.thread_id,
         mcp_enabled=state.mcp_enabled if mcp_enabled is None else mcp_enabled,
-        model_override=state.model if model_override is None else model_override,
+        model_override=resolved_model_override,
     )
     return ChatRuntimeState(
         thread_id=context.thread_id,
@@ -953,6 +994,7 @@ async def refresh_runtime_state(
         mcp_tools=context.mcp_tools,
         trace_enabled=state.trace_enabled,
         file_completion_roots=list(state.file_completion_roots),
+        model_override=resolved_model_override,
     )
 
 
@@ -1002,6 +1044,81 @@ def render_preview_block(content: str, *, max_lines: int = 8, max_chars: int = 5
         remaining = len(trimmed) - max_lines
         return [*trimmed[:max_lines], f"... (+{remaining} more lines)"]
     return trimmed
+
+
+def strip_markdown_inline(text: str) -> str:
+    text = re.sub(r"`([^`]+)`", r"\1", text)
+    text = re.sub(r"\*\*([^*]+)\*\*", r"\1", text)
+    text = re.sub(r"__([^_]+)__", r"\1", text)
+    text = re.sub(r"(?<!\*)\*([^*]+)\*(?!\*)", r"\1", text)
+    text = re.sub(r"(?<!_)_([^_]+)_(?!_)", r"\1", text)
+    text = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", text)
+    return text.strip()
+
+
+def format_assistant_response(response: str) -> str:
+    lines = response.splitlines()
+    rendered: list[str] = []
+    in_code_block = False
+
+    for raw_line in lines:
+        line = raw_line.rstrip()
+        stripped = line.strip()
+
+        if stripped.startswith("```"):
+            if rendered and rendered[-1] != "":
+                rendered.append("")
+            in_code_block = not in_code_block
+            continue
+
+        if in_code_block:
+            rendered.append(f"    {line}")
+            continue
+
+        if not stripped:
+            if rendered and rendered[-1] != "":
+                rendered.append("")
+            continue
+
+        if re.fullmatch(r"[-*_]{3,}", stripped):
+            if rendered and rendered[-1] != "":
+                rendered.append("")
+            continue
+
+        heading_match = re.match(r"^(#{1,6})\s+(.*)$", stripped)
+        if heading_match:
+            level = len(heading_match.group(1))
+            heading_text = strip_markdown_inline(heading_match.group(2))
+            if rendered and rendered[-1] != "":
+                rendered.append("")
+            rendered.append(heading_text.upper() if level <= 2 else heading_text)
+            continue
+
+        bullet_match = re.match(r"^[-*+]\s+(.*)$", stripped)
+        if bullet_match:
+            bullet_text = strip_markdown_inline(bullet_match.group(1))
+            label_match = re.match(r"^([^:.-]+?)\s+[—-]\s+(.*)$", bullet_text)
+            if label_match:
+                bullet_text = f"{label_match.group(1).strip()}: {label_match.group(2).strip()}"
+            rendered.append(f"  - {bullet_text}")
+            continue
+
+        numbered_match = re.match(r"^(\d+)\.\s+(.*)$", stripped)
+        if numbered_match:
+            item_text = strip_markdown_inline(numbered_match.group(2))
+            rendered.append(f"{numbered_match.group(1)}. {item_text}")
+            continue
+
+        rendered.append(strip_markdown_inline(stripped))
+
+    while rendered and rendered[-1] == "":
+        rendered.pop()
+
+    return "\n".join(rendered)
+
+
+def print_assistant_response(response: str) -> None:
+    print(format_assistant_response(response))
 
 
 def print_trace_event_card(event: ConversationTraceEvent, state: ChatRuntimeState) -> None:
@@ -1133,6 +1250,8 @@ async def handle_slash_command(
                 return state, True
             return await handle_slash_command(selection, state, interactive=False)
         if not argument:
+            if state.model_override is None:
+                state = await refresh_runtime_state(state)
             print(f"Current model: {state.model}")
             return state, True
         state = await refresh_runtime_state(state, model_override=argument)
@@ -1186,13 +1305,13 @@ async def run_chat(args: argparse.Namespace) -> int:
             message_input,
             session_id=state.thread_id,
             mcp_enabled=state.mcp_enabled,
-            model_override=state.model,
+            model_override=state.model_override,
         ):
             if state.trace_enabled and event.kind != "final_response":
                 print_trace_event_card(event, state)
             if event.kind == "final_response":
                 print()
-                print(event.response)
+                print_assistant_response(event.response)
         return 0
 
     print("Enter `/help` to list commands. Use `/exit` to leave the session.")
@@ -1214,7 +1333,7 @@ async def run_chat(args: argparse.Namespace) -> int:
 
         if not user_input:
             continue
-        if user_input.startswith("/"):
+        if is_slash_command_input(user_input):
             state, should_continue = await handle_slash_command(
                 user_input,
                 state,
@@ -1231,13 +1350,14 @@ async def run_chat(args: argparse.Namespace) -> int:
             message_input,
             session_id=state.thread_id,
             mcp_enabled=state.mcp_enabled,
-            model_override=state.model,
+            model_override=state.model_override,
         ):
             if state.trace_enabled and event.kind != "final_response":
                 print_trace_event_card(event, state)
             if event.kind == "final_response":
                 print()
-                print(event.response)
+                print_assistant_response(event.response)
+        state = await refresh_runtime_state(state)
 
 
 def run_serve(args: argparse.Namespace) -> int:

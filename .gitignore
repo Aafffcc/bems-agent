@@ -12,3 +12,4 @@ build/
 *.pyd
 .env
 config
+.DS_Store
